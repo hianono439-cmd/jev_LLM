@@ -45,6 +45,30 @@ python3 jev_normalize.py --questions fwd --workers 1     # LLM 과 같은 기준
 
 LLM 결과와 비교할 Jev 결과는 `results/` 에 있다. 질문 구성이 같은 파일끼리 비교한다 (LLM `--rev` 없음이면 `results/jev_kall_fwd_*.jsonl`, `--rev` 면 `results/jev_kall_fwd+rev_*.jsonl`).
 
+## 실제 데이터가 오면
+
+가상 데이터(`data/sample/`)와 **같은 칸 이름**의 CSV 두 개를 새 폴더(예: `data/real/`)에 둔다. 코드는 고치지 않는다.
+
+| 파일 | 필수 칸 | 선택 칸 |
+|---|---|---|
+| `mentions.csv` | `mention_id` `entity_type`(project/client/skill) `surface` `gold_id`(표준 목록에 없으면 `NONE`) `split`(dev/test) `ctx_client` `ctx_period` `ctx_role` (project 외에는 빈칸) | `variant` `missing_client` (없으면 채점표의 유형별 · 결측별 칸이 빈다) |
+| `standard.csv` | `entity_id` `entity_type` `name` `client_id` `period_start` `period_end` `group` `industry` (해당 없는 칸은 빈칸) | `aliases` (`\|` 로 구분) |
+
+순서 — 1단계는 API 호출이 없다. 2단계부터 키를 쓴다.
+
+```bash
+python3 check_data.py data/real --price-in <$/1M> --price-out <$/1M>   # 1. 형식 검사 + 선택지 수 + LLM 호출 수 · 토큰 · 비용 추정
+python3 jev_normalize.py --data data/real --questions fwd,rev --workers 1   # 2. Jev
+python3 llm_normalize.py --data data/real --k all --limit 20 --rev          # 3. LLM 소량 확인
+python3 llm_normalize.py --data data/real --k all --rev                     # 4. LLM 전체 (선택지 20개 초과가 있으면 --over20 logit_bias)
+python3 check_parity.py out/jev_kall_*.jsonl out/llm_kall_*.jsonl           # 5. 같은 조건인지
+python3 score.py out/jev_kall_*.jsonl out/llm_kall_*.jsonl --price-in <$/1M> --price-out <$/1M>   # 6. 비교표
+```
+
+`check_data.py` 가 알려 주는 것: 필수 칸 누락, `gold_id` 가 표준 목록에 없음, `split` · `entity_type` 값 오류, ID 중복, 기간을 못 읽는 행,
+유형별 최대 선택지 수(20개 초과면 LLM 은 `--over20 logit_bias` 필요, 26개 초과면 숫자 라벨), `k=5` 일 때 정답이 후보에 드는 비율.
+토큰 추정은 프롬프트를 실제로 만들어 세므로, 가상 데이터 20건 실측(입력 39,860)과 0.4% 안에서 맞았다.
+
 ## 상태
 
 - 실제 데이터·API로는 아직 실행 전 (가짜 모듈로만 동작 확인)

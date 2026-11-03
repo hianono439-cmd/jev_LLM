@@ -1,13 +1,14 @@
 """실제 데이터 → 비교 입력(mentions.csv · standard.csv) 변환.
 
-추출 결과는 「이력 한 건 = 한 줄, 8개 항목」 인데, 비교 코드(common.load_data)는 「표기 하나 = 한 줄」 을 읽는다.
+추출 결과는 「이력 한 건 = 한 줄, 7개 항목」 인데, 비교 코드(common.load_data)는 「표기 하나 = 한 줄」 을 읽는다.
 이 스크립트가 그 사이를 잇는다. Jev 쪽 · LLM 쪽 모두 이 출력 폴더를 --data 로 그대로 쓴다.
 
     python3 prepare_real.py --records 추출결과.csv --standard 표준목록.csv --out data/real_full
     python3 prepare_real.py --records 결측세트.csv  --standard 표준목록.csv --out data/real_missing
 
 입력 1. 레코드 (CSV 또는 JSON 배열). 칸 이름은 한글/영문 둘 다 받는다. 빈 칸 = 결측.
-  이름(name) 프로젝트명(project) 고객사(client) 역할(role) 기술(skills) 기간(period) 시작일자(start_date) 종료일자(end_date)
+  프로젝트명(project) 고객사(client) 역할(role) 기술(skills) 기간(period) 시작일자(start_date) 종료일자(end_date)
+  사람ID(person_id, 선택): 같은 사람의 이력을 dev/test 한쪽에 모으는 데만 쓴다. 없으면 레코드마다 따로 나눈다.
   기술은 「, · / ; |」 중 무엇으로 구분해도 된다. JSON 이면 리스트도 된다.
   정답(선택, 있어야 정확도가 나온다):
   정답_프로젝트(gold_project) 정답_고객사(gold_client) 정답_기술(gold_skills: 「표기=ID; 표기=ID」 또는 JSON {표기: ID})
@@ -18,8 +19,8 @@
   entity_id entity_type(client|project|skill) name client_id period_start period_end group industry aliases(「|」 구분)
 
 출력: <out>/mentions.csv (record_id 칸 추가 — 다른 코드는 무시함), <out>/standard.csv (검사 후 복사), 요약 출력.
-분할(split): 같은 사람 이력이 dev/test 에 갈라지지 않게 이름의 해시로 반반 나눈다(재실행해도 같다).
-역할 · 이름은 정규화 대상이 아니다(규격: project · client · skill). 역할은 프로젝트 판정의 문맥(ctx_role)으로만 들어간다.
+분할(split): 사람ID(없으면 레코드ID)의 해시로 dev/test 반반(재실행해도 같다).
+역할은 정규화 대상이 아니다(규격: project · client · skill). 역할은 프로젝트 판정의 문맥(ctx_role)으로만 들어간다.
 """
 import argparse
 import csv
@@ -30,7 +31,7 @@ import sys
 from pathlib import Path
 
 ALIASES = {
-    "name": ["이름", "name", "성명"],
+    "name": ["사람ID", "person_id", "사번", "구성원ID", "이름", "name", "성명"],   # dev/test 분할 기준(선택)
     "project": ["프로젝트명", "프로젝트", "project", "project_name"],
     "client": ["고객사", "client", "customer"],
     "role": ["역할", "role"],

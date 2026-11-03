@@ -14,6 +14,8 @@
   error      : (기본) 해당 mention을 error로 남긴다. 처리 방식은 이헌준과 합의 전.
   logit_bias : 같은 프롬프트를 다시 보내되 이미 읽은 라벨을 logit_bias -100으로 막아 다음 라벨들을 읽는다.
                막힌 뒤의 확률 p' 와 원래 확률 p 는 p = p' × (1 − 이미 읽은 확률 합) 관계라 정확히 복원된다.
+               ' A' 처럼 공백 붙은 형태도 함께 막고, 남은 라벨 확률 상한이 1e-4 미만이면 멈춘다(이헌준 조건 2·3).
+               사용 전 --verify-chain 10 으로 복원 오차를 숫자로 남긴다(조건 1).
                질문·선택지는 바뀌지 않고 호출만 ceil(n/20)회 안팎으로 늘어난다(토큰·지연은 모두 합산 기록). tiktoken 필요.
 """
 import argparse
@@ -88,38 +90,101 @@ class LLM:
         return lp.token, {t.token: t.logprob for t in lp.top_logprobs}, r.usage, ms
 
 
-def label_probs(llm, prompt, labels, over20):
-    """라벨별 확률(정규화 전 원래 확률). 반환 (probs{label:p}, first_token, in_tok, out_tok, ms, calls)."""
+STOP_MASS = 1e-4   # 연쇄 조회 멈춤: 남은 라벨 하나가 가질 수 있는 확률 상한이 이보다 작으면 멈춘다
+
+
+def _label_token_ids(enc, lab):
+    """라벨의 모든 형태('A', ' A')의 토큰 ID. 한 토큰인 형태만 막을 수 있으므로 '라벨' 자체가 한 토큰이 아니면 오류."""
+    ids = enc.encode(lab)
+    if len(ids) != 1:
+        raise RuntimeError(f"라벨 '{lab}' 이 한 토큰이 아님")
+    out = {lab: ids[0]}
+    sp = enc.encode(" " + lab)
+    if len(sp) == 1:
+        out[" " + lab] = sp[0]
+    return out
+
+
+def label_probs(llm, prompt, labels, over20, first_take=None):
+    """라벨별 확률(전체 어휘 기준, 라벨끼리 정규화 전). 반환 (probs{label:p}, first_token, in_tok, out_tok, ms, calls).
+
+    선택지가 top_logprobs 상한(20)을 넘거나 first_take(검증용: 첫 호출에서 상위 몇 개 라벨만 읽은 척)가 있으면
+    logit_bias 연쇄 조회를 한다. 호출 r 에서 막힌 토큰들의 실제 확률 합을 B 라 하면, 막힌 뒤 분포 p_r 와 실제 확률 p 는
+    p = p_r × (1 − B). B 는 지금까지 읽은 토큰(라벨과 ' 라벨' 형태)의 실제 확률 합이다.
+    """
     tok, top, u, ms = llm.first_token(prompt)
     in_tok, out_tok, calls = u.prompt_tokens, u.completion_tokens, 1
-    probs = {lab: math.exp(top[lab]) for lab in labels if lab in top}
+    true_p = {t: math.exp(lp) for t, lp in top.items()}          # 토큰 → 실제 확률(전체 어휘 기준)
+    probs = {lab: true_p[lab] for lab in labels if lab in true_p}
+    if first_take is not None:
+        keep = sorted(probs, key=probs.get, reverse=True)[:first_take]
+        probs = {lab: probs[lab] for lab in keep}
     unseen = [lab for lab in labels if lab not in probs]
-    if unseen and len(labels) > TOP_N:
-        if over20 != "logit_bias":
+    need_chain = unseen and (len(labels) > TOP_N or first_take is not None)
+    if need_chain:
+        if over20 != "logit_bias" and first_take is None:
             raise RuntimeError(f"선택지 {len(labels)}개 > top_logprobs {TOP_N}: 처리 방식 합의 전(--over20)")
-        enc, banned_mass = llm.enc(), 0.0
-        while unseen:
-            banned = [lab for lab in labels if lab in probs]
-            bias = {}
-            for lab in banned:
-                ids = enc.encode(lab)
-                if len(ids) != 1:
-                    raise RuntimeError(f"라벨 '{lab}' 이 한 토큰이 아님")
-                bias[str(ids[0])] = -100
-            if len(bias) > 300:
+        enc = llm.enc()
+        forms = {lab: _label_token_ids(enc, lab) for lab in labels}
+        floor = min(true_p.values()) if true_p else 0.0              # 직전 호출에서 읽힌 가장 작은 확률(=안 읽힌 것의 상한)
+        tok_id = {}                                                    # 막을 수 있는(한 토큰으로 되돌아가는) 토큰 → ID
+        for f in forms.values():
+            tok_id.update(f)
+        while unseen and floor >= STOP_MASS:
+            # 이미 읽은 토큰은 라벨이든 아니든(top_logprobs 자리를 차지하는 다른 토큰 포함) 모두 막아야 다음 순위가 보인다
+            for t in true_p:
+                if t not in tok_id:
+                    ids = enc.encode(t)
+                    if len(ids) == 1:
+                        tok_id[t] = ids[0]
+            blocked = {t: tok_id[t] for t in true_p if t in tok_id}
+            for lab in probs:
+                blocked.update(forms[lab])
+            if len(blocked) > 300:
                 raise RuntimeError("logit_bias 300개 상한 초과")
-            banned_mass = sum(probs.values())
-            _, top2, u2, ms2 = llm.first_token(prompt, logit_bias=bias)
+            B = sum(true_p.get(t, 0.0) for t in blocked)                # 못 본 ' 라벨' 형태는 0으로 근사(floor 미만)
+            _, top2, u2, ms2 = llm.first_token(prompt, logit_bias={str(i): -100 for i in blocked.values()})
             in_tok += u2.prompt_tokens
             out_tok += u2.completion_tokens
             ms += ms2
             calls += 1
-            new = {lab: math.exp(top2[lab]) * (1 - banned_mass) for lab in unseen if lab in top2}
-            if not new:   # 남은 라벨의 확률이 사실상 0 (다른 토큰에 밀림)
+            scale = max(1.0 - B, 0.0)
+            fresh = {t: math.exp(lp) * scale for t, lp in top2.items() if t not in blocked}
+            if not fresh:
                 break
-            probs.update(new)
+            for t, v in fresh.items():
+                true_p.setdefault(t, v)
+            probs.update({lab: true_p[lab] for lab in unseen if lab in true_p})
             unseen = [lab for lab in labels if lab not in probs]
+            floor = min(fresh.values())
     return probs, tok, in_tok, out_tok, ms, calls
+
+
+def verify_chain(llm, data, n=10, first_take=5):
+    """헌준 조건 1: 선택지 20개 이하 mention 에서 (가) 한 번에 읽은 확률 vs (나) 상위 first_take 개만 읽고 연쇄로 복원한 확률."""
+    from common import build_candidates, load_data
+    from jev_normalize import build_request
+    standard, mentions = load_data(data)
+    done, worst = 0, 0.0
+    for m in mentions:
+        cands = build_candidates(m, standard, k=None)
+        q = build_request(m, cands, model="")["questions"]["same_fwd"]
+        ids = list(q["criteria"])
+        if len(ids) > TOP_N or len(ids) <= first_take + 2:
+            continue
+        labels = make_labels(len(ids))
+        prompt = build_prompt(build_request(m, cands, model="")["state"], q, ids, labels)
+        a = label_probs(llm, prompt, labels, "error")[0]
+        b, *_rest, calls = label_probs(llm, prompt, labels, "logit_bias", first_take=first_take)
+        diff = max(abs(a.get(l, 0.0) - b.get(l, 0.0)) for l in labels)
+        worst = max(worst, diff)
+        top3 = sorted(a, key=a.get, reverse=True)[:3]
+        print(f"{m['mention_id']} 선택지 {len(ids)}  연쇄 호출 {calls}  최대 절대차 {diff:.2e}  "
+              f"상위3 한번에 {[round(a[l], 4) for l in top3]} / 복원 {[round(b.get(l, 0), 4) for l in top3]}")
+        done += 1
+        if done >= n:
+            break
+    print(f"검증 {done}건, 라벨 확률 최대 절대차 {worst:.2e}")
 
 
 def ask(llm, state, q, over20):
@@ -192,11 +257,14 @@ def main():
     ap.add_argument("--split", default=None, help="이 split만 (예: dev)")
     ap.add_argument("--over20", choices=["error", "logit_bias"], default="error")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--verify-chain", type=int, default=0, help="연쇄 조회 복원 검증 n건 (선택지 20개 이하 mention, 상위 5개만 읽고 복원)")
     a = ap.parse_args()
     load_dotenv()
     llm = LLM(a.model or os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"))
     if a.probe:
         return probe(llm)
+    if a.verify_chain:
+        return verify_chain(llm, a.data, n=a.verify_chain)
     k = None if a.k == "all" else int(a.k)
     config = "k=all" if k is None else f"k={k}"
     from common import load_data

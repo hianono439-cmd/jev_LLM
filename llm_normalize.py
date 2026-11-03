@@ -22,8 +22,7 @@ import math
 import os
 import time
 
-from common import build_candidates, gold_in_candidates, load_data  # 수정 금지 모듈
-from jev_normalize import build_request  # 수정 금지 모듈
+# common / jev_normalize(수정 금지 모듈)는 실제 정규화할 때만 import 한다 — --probe 는 그 파일 없이도 돈다.
 
 HEAD_KEYS = ["mention_id", "entity_type", "surface", "gold_id", "variant", "missing_client", "split"]
 SYSTEM = "선택지 라벨 하나만 답하라."
@@ -141,6 +140,8 @@ def ask(llm, state, q, over20):
 
 
 def run_one(llm, m, standard, k, rev, over20, config, repeat=0):
+    from common import build_candidates, gold_in_candidates
+    from jev_normalize import build_request
     row = {key: m.get(key) for key in HEAD_KEYS}
     row.update(system="llm", config=config, model=llm.model, repeat=repeat)
     try:
@@ -198,6 +199,7 @@ def main():
         return probe(llm)
     k = None if a.k == "all" else int(a.k)
     config = "k=all" if k is None else f"k={k}"
+    from common import load_data
     standard, mentions = load_data(a.data)
     if a.split:
         mentions = [m for m in mentions if m.get("split") == a.split]

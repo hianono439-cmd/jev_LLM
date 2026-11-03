@@ -9,6 +9,8 @@ mention 하나당 요청 하나. 같은 요청 안에 질문 셋을 넣는다(�
     python3 jev_normalize.py --show-request       # 첫 요청 본문만 찍고 끝
     python3 jev_normalize.py --limit 20           # 실제 호출, 20건만
     python3 jev_normalize.py --k 5                # 후보를 상위 5개로 좁혀서
+    python3 jev_normalize.py --summary out/jev_….jsonl   # 이미 있는 결과 요약 (호출 없음)
+터미널에 모델 · 설정 · mention 별 한 줄 · 요약이 나오고 out/<결과>.log 에도 남는다(runlog.py, LLM 쪽과 같은 형식).
 """
 import argparse
 import json
@@ -23,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from common import NONE_ID, ROOT, build_candidates, gold_in_candidates, load_data, load_env
+from runlog import log, log_row, setup_log, summarize
 
 API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-1.14.0"  # 별칭(jev-latest) 대신 버전 고정 — 문턱값을 맞춘 뒤 모델이 바뀌면 안 된다(공식 문서)
@@ -149,7 +152,15 @@ def main():
     ap.add_argument("--workers", type=int, default=4, help="동시 요청 수. 지연을 잴 때는 1")
     ap.add_argument("--mock", action="store_true")
     ap.add_argument("--show-request", action="store_true")
+    ap.add_argument("--summary", metavar="JSONL", help="이미 있는 결과 파일을 터미널에 요약하고 끝 (호출 없음)")
+    ap.add_argument("-q", "--quiet", action="store_true", help="mention 별 줄은 로그 파일에만")
+    ap.add_argument("--price-in", type=float, default=0.042, help="요약 비용용 입력 100만 토큰당 $ (Jev 기본 0.042)")
+    ap.add_argument("--price-out", type=float, default=0.0)
     args = ap.parse_args()
+    if args.summary:
+        setup_log()
+        rows = [json.loads(x) for x in open(args.summary, encoding="utf-8") if x.strip()]
+        return summarize(rows, args.summary, args.price_in, args.price_out)
     args.questions = tuple(q.strip() for q in args.questions.split(",") if q.strip())
 
     load_env()
@@ -172,13 +183,21 @@ def main():
     qtag = "" if args.questions == ("fwd", "rev", "noul") else "_" + "+".join(args.questions)
     tag = f"jev{'-mock' if args.mock else ''}_k{args.k or 'all'}{qtag}_{datetime.now():%m%d-%H%M}"
     out = out_dir / f"{tag}.jsonl"
+    setup_log(out.with_suffix(".log"), args.quiet)
+    log.info(f"[Jev 정규화] 모델 {'mock' if args.mock else args.model} · k={args.k or 'all'} · 질문 {'+'.join(args.questions)}"
+             f" · 동시 요청 {args.workers}")
+    log.info(f"  데이터 {args.data}  mention {len(mentions)}건 × 반복 {args.repeat}  → 요청 {len(mentions) * args.repeat}회")
+    log.info(f"  결과 {out}")
+    rows, t0 = [], time.perf_counter()
     with open(out, "w", encoding="utf-8") as f, ThreadPoolExecutor(args.workers) as ex:
         for r in range(args.repeat):
-            for rec in ex.map(lambda m: run_one(m, standard, args, key), mentions):
+            for i, rec in enumerate(ex.map(lambda m: run_one(m, standard, args, key), mentions)):
                 rec["repeat"] = r
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    print(f"{len(mentions) * args.repeat}건 → {out}")
-    print(f"채점: python3 score.py {out}")
+                f.flush()
+                rows.append(rec)
+                log_row(rec, i + 1, len(mentions))
+    summarize(rows, str(out), args.price_in, args.price_out, elapsed=time.perf_counter() - t0)
 
 
 if __name__ == "__main__":

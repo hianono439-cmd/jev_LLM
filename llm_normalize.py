@@ -10,6 +10,13 @@
   python3 llm_normalize.py --data data/sample --k 5 --rev
 .env: OPENAI_API_KEY, OPENAI_MODEL(기본 gpt-4.1-mini)
 
+터미널 출력 / 로그:
+  시작할 때 모델 · 데이터 · 설정 · 건수, 실행 중 건마다 「표기 → 예측(이름) 확신도 · 정답 여부 · 지연 · 토큰 · 호출 수」,
+  끝에 정확도 · 오류 · 지연(중앙값/p95) · 토큰 · 추정 비용 요약을 찍는다. 같은 내용이 out/<결과파일>.log 에도 남는다.
+  --quiet      : 건별 줄은 로그 파일에만(터미널엔 20건마다 진행률)
+  --log-level DEBUG : 프롬프트 원문 · 확률 상위 5개 · 재시도까지 로그에 남김
+  --price-in / --price-out : 추정 비용 단가($/100만 토큰, 기본 gpt-4.1-mini 0.40 / 1.60 — 공식 가격표로 확인할 것)
+
 선택지가 top_logprobs 상한(20)을 넘는 경우(--over20):
   error      : (기본) 해당 mention을 error로 남긴다. 처리 방식은 이헌준과 합의 전.
   logit_bias : 같은 프롬프트를 다시 보내되 이미 읽은 라벨을 logit_bias -100으로 막아 다음 라벨들을 읽는다.
@@ -20,9 +27,14 @@
 """
 import argparse
 import json
+import logging
 import math
 import os
+import statistics
+import sys
 import time
+
+log = logging.getLogger("llm_normalize")
 
 # common / jev_normalize(수정 금지 모듈)는 실제 정규화할 때만 import 한다 — --probe 는 그 파일 없이도 돈다.
 
@@ -81,9 +93,11 @@ class LLM:
             try:
                 r = self.client.chat.completions.create(**kw)
                 break
-            except (self.o.RateLimitError, self.o.APIConnectionError, self.o.InternalServerError):
+            except (self.o.RateLimitError, self.o.APIConnectionError, self.o.InternalServerError) as e:
                 if a == attempts:
+                    log.error("호출 실패(재시도 %d회 소진): %s", attempts, e)
                     raise
+                log.warning("호출 재시도 %d/%d (%ds 대기): %s", a, attempts - 1, min(2 ** a, 16), type(e).__name__)
                 time.sleep(min(2 ** a, 16))
         ms = (time.perf_counter() - t0) * 1000
         lp = r.choices[0].logprobs.content[0]
@@ -190,7 +204,9 @@ def verify_chain(llm, data, n=10, first_take=5):
 def ask(llm, state, q, over20):
     ids = list(q["criteria"])                 # 순서 그대로, 마지막이 NONE
     labels = make_labels(len(ids))
-    probs, tok, in_tok, out_tok, ms, calls = label_probs(llm, build_prompt(state, q, ids, labels), labels, over20)
+    prompt = build_prompt(state, q, ids, labels)
+    log.debug("프롬프트(%d 선택지)\n%s", len(ids), prompt)
+    probs, tok, in_tok, out_tok, ms, calls = label_probs(llm, prompt, labels, over20)
     if tok.strip() != tok or tok not in labels:
         raise RuntimeError(f"첫 토큰이 라벨이 아님: {tok!r}")
     p = {i: probs.get(lab, 0.0) for lab, i in zip(labels, ids)}
@@ -257,6 +273,10 @@ def main():
     ap.add_argument("--split", default=None, help="이 split만 (예: dev)")
     ap.add_argument("--over20", choices=["error", "logit_bias"], default="error")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--quiet", action="store_true", help="건별 결과는 로그 파일에만")
+    ap.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING"])
+    ap.add_argument("--price-in", type=float, default=0.40, help="$/100만 입력 토큰 (추정 비용 표시용)")
+    ap.add_argument("--price-out", type=float, default=1.60, help="$/100만 출력 토큰")
     ap.add_argument("--verify-chain", type=int, default=0, help="연쇄 조회 복원 검증 n건 (선택지 20개 이하 mention, 상위 5개만 읽고 복원)")
     a = ap.parse_args()
     load_dotenv()
@@ -275,18 +295,96 @@ def main():
         mentions = mentions[: a.limit]
     os.makedirs("out", exist_ok=True)
     path = f"out/llm_k{a.k}_{time.strftime('%m%d-%H%M')}.jsonl"
-    n_err = 0
+    setup_logging(path[:-len(".jsonl")] + ".log", a.log_level, a.quiet)
+    names = {r["entity_id"]: r["name"] for r in standard}
+    total = len(mentions) * a.repeat
+    log.info("모델 %s | 데이터 %s | %s | 역순질문 %s | 20초과 %s | %d건%s",
+             llm.model, a.data, config, "켬" if a.rev else "끔", a.over20, len(mentions),
+             f" × 반복 {a.repeat}" if a.repeat > 1 else "")
+    log.info("결과 %s", path)
+    rows, t0 = [], time.perf_counter()
     with open(path, "w", encoding="utf-8") as f:
         for r in range(a.repeat):
             for i, m in enumerate(mentions):
                 row = run_one(llm, m, standard, k, a.rev, a.over20, config, repeat=r)
-                n_err += "error" in row
+                rows.append(row)
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 f.flush()
-                if (i + 1) % 20 == 0:
-                    print(f"  {i + 1}/{len(mentions)}  오류 {n_err}")
-    print(f"완료 {path}  (오류 {n_err})")
+                n = r * len(mentions) + i + 1
+                log.log(ROW, "%s", row_line(row, names, n, total))
+                if row.get("probabilities"):
+                    top = sorted(row["probabilities"].items(), key=lambda x: -x[1])[:5]
+                    log.debug("  확률 상위: %s", ", ".join(f"{k} {v:.3f}" for k, v in top))
+                if a.quiet and n % 20 == 0:
+                    log.info("  %d/%d  오류 %d", n, total, sum("error" in x for x in rows))
+    summarize(rows, llm.model, a.price_in, a.price_out, time.perf_counter() - t0, path)
 
+
+ROW = 15   # INFO(20)보다 낮은 레벨: --quiet 면 파일에만 남는다
+logging.addLevelName(ROW, "ROW")
+
+
+def setup_logging(log_path, level, quiet):
+    log.setLevel(min(ROW, getattr(logging, level)))
+    log.handlers.clear()
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setLevel(min(ROW, getattr(logging, level)))
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s", "%H:%M:%S"))
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO if quiet else min(ROW, getattr(logging, level)))
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    log.addHandler(fh)
+    log.addHandler(ch)
+    log.info("로그 %s", log_path)
+
+
+def _short(x, n=24):
+    x = str(x)
+    return x if len(x) <= n else x[: n - 1] + "…"
+
+
+def row_line(row, names, n, total):
+    head = f"[{n}/{total}] {row.get('mention_id')} {row.get('entity_type', ''):7} {_short(row.get('surface'))!r}"
+    if "error" in row:
+        return f"{head} → 오류 {_short(row['error'], 120)}"
+    pred = row["pred_id"]
+    name = "목록에 없음" if pred == "NONE" else names.get(pred, "?")
+    gold = row.get("gold_id")
+    mark = "" if not gold else ("✓" if pred == gold else f"✗ 정답 {gold}({_short(names.get(gold, gold), 16)})")
+    rev = ""
+    if "pred_id_rev" in row:
+        rev = " 역순 같음" if row["pred_id_rev"] == pred else f" 역순 {row['pred_id_rev']}(다름)"
+    return (f"{head} → {pred} {_short(name, 20)} 확신 {row['confidence']:.2f} {mark}{rev} | "
+            f"{row['latency_ms']}ms 입력 {row['input_tokens']:,} 출력 {row['output_tokens']} 호출 {row['llm_calls']}")
+
+
+def summarize(rows, model, price_in, price_out, wall_s, path):
+    ok = [r for r in rows if "error" not in r]
+    graded = [r for r in rows if r.get("gold_id")]          # 오류 건은 오답으로 센다
+    lat = sorted(r["latency_ms"] for r in ok)
+    tin, tout = sum(r["input_tokens"] for r in ok), sum(r["output_tokens"] for r in ok)
+    cost = tin / 1e6 * price_in + tout / 1e6 * price_out
+    log.info("─" * 60)
+    log.info("모델 %s | 완료 %d건 (오류 %d) | 총 %.1f초", model, len(rows), len(rows) - len(ok), wall_s)
+    if graded:
+        right = sum(r.get("pred_id") == r["gold_id"] for r in graded)
+        log.info("정확도 %.1f%% (%d/%d, 정답 있는 건, 오류는 오답)", 100 * right / len(graded), right, len(graded))
+        by = {}
+        for r in graded:
+            by.setdefault(r["entity_type"], []).append(r.get("pred_id") == r["gold_id"])
+        log.info("  유형별 %s", "  ".join(f"{t} {100 * sum(v) / len(v):.0f}%({len(v)})" for t, v in sorted(by.items())))
+    else:
+        log.info("정확도 -- (정답 칸이 비어 있음)")
+    if any("pred_id_rev" in r for r in ok):
+        same = sum(r.get("pred_id_rev") == r["pred_id"] for r in ok)
+        log.info("역순 질문 일치 %.1f%% (%d/%d)", 100 * same / len(ok), same, len(ok))
+    if lat:
+        p95 = lat[min(len(lat) - 1, math.ceil(0.95 * len(lat)) - 1)]
+        log.info("지연 중앙값 %.0fms  p95 %dms  (건당, 재시도 포함)", statistics.median(lat), p95)
+        log.info("토큰 입력 %s  출력 %s  호출 %d회", f"{tin:,}", f"{tout:,}", sum(r["llm_calls"] for r in ok))
+        log.info("추정 비용 $%.4f  (1,000건당 $%.3f, 단가 입력 $%.2f / 출력 $%.2f per 100만 토큰)",
+                 cost, cost / len(ok) * 1000, price_in, price_out)
+    log.info("결과 %s", path)
 
 if __name__ == "__main__":
     main()

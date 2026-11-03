@@ -6,7 +6,8 @@
     python3 prepare_real.py --records 추출결과.csv --standard 표준목록.csv --out data/real_full
     python3 prepare_real.py --records 결측세트.csv  --standard 표준목록.csv --out data/real_missing
 
-입력 1. 레코드 (CSV 또는 JSON 배열). 칸 이름은 한글/영문 둘 다 받는다. 빈 칸 = 결측.
+입력 1. 레코드 (CSV, JSON 배열, 또는 추출 담당 출력 JSON {name, projects:[...]} — 파일 하나나 그런 파일이 든 폴더).
+  칸 이름은 한글/영문 둘 다 받는다(technologies → 기술, duration → 기간). 빈 칸·null = 결측.
   프로젝트명(project) 고객사(client) 역할(role) 기술(skills) 기간(period) 시작일자(start_date) 종료일자(end_date)
   사람ID(person_id, 선택): 같은 사람의 이력을 dev/test 한쪽에 모으는 데만 쓴다. 없으면 레코드마다 따로 나눈다.
   기술은 「, · / ; |」 중 무엇으로 구분해도 된다. JSON 이면 리스트도 된다.
@@ -35,8 +36,8 @@ ALIASES = {
     "project": ["프로젝트명", "프로젝트", "project", "project_name"],
     "client": ["고객사", "client", "customer"],
     "role": ["역할", "role"],
-    "skills": ["기술", "skills", "skill", "기술스택"],
-    "period": ["기간", "period"],
+    "skills": ["기술", "skills", "skill", "기술스택", "technologies", "tech_stack"],
+    "period": ["기간", "period", "duration"],
     "start_date": ["시작일자", "시작일", "start_date", "start"],
     "end_date": ["종료일자", "종료일", "end_date", "end"],
     "gold_project": ["정답_프로젝트", "gold_project"],
@@ -52,10 +53,24 @@ _YM = re.compile(r"(\d{4})\s*[.\-/년]\s*(\d{1,2})|(?<![\d.])(\d{2})\s*[./]\s*(\
 _ONGOING = re.compile(r"현재|재직|진행|now|present", re.I)
 
 
+def _flatten(doc, src):
+    """추출 담당 출력 형식 {name, projects: [...]} 을 「이력 한 건 = 한 줄」 로 편다.
+    이름은 dev/test 분할에만 쓰고, record_id 는 「파일명#순번」."""
+    if isinstance(doc, dict) and isinstance(doc.get("projects"), list):
+        return [{**pr, "name": doc.get("name"), "record_id": pr.get("record_id") or f"{src}#{j + 1}"}
+                for j, pr in enumerate(doc["projects"])]
+    if isinstance(doc, list):
+        return [r for d in doc for r in (_flatten(d, src) if isinstance(d, dict) and "projects" in d else [d])]
+    return [doc]
+
+
 def read_records(path):
     p = Path(path)
-    if p.suffix.lower() == ".json":
-        rows = json.loads(p.read_text(encoding="utf-8"))
+    if p.is_dir():                                     # 사람 한 명 = JSON 파일 하나인 폴더
+        rows = [r for f in sorted(p.glob("*.json"))
+                for r in _flatten(json.loads(f.read_text(encoding="utf-8")), f.stem)]
+    elif p.suffix.lower() == ".json":
+        rows = _flatten(json.loads(p.read_text(encoding="utf-8")), p.stem)
     else:
         with open(p, newline="", encoding="utf-8-sig") as f:
             rows = list(csv.DictReader(f))

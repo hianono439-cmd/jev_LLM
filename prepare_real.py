@@ -11,7 +11,7 @@
   기술은 「, · / ; |」 중 무엇으로 구분해도 된다. JSON 이면 리스트도 된다.
   정답(선택, 있어야 정확도가 나온다):
   정답_프로젝트(gold_project) 정답_고객사(gold_client) 정답_기술(gold_skills: 「표기=ID; 표기=ID」 또는 JSON {표기: ID})
-  표준 목록에 없으면 NONE. 정답이 없으면 gold_id 칸이 비고, 비용·시간 비교만 의미가 있다.
+  표준 목록에 없으면 NONE. 정답이 없으면 gold_id 칸이 비고 check_data.py 가 오류로 잡는다.
   변형(variant, 선택): 분석용 분류. 없으면 「실데이터」.
 
 입력 2. 표준 목록 CSV — data/sample/standard.csv 와 같은 칸:
@@ -227,7 +227,7 @@ def main():
     n_choices = {t: sum(r["entity_type"] == t for r in std_rows) + 1 for t in ("project", "client", "skill")}
     print(f"레코드 {len(records)}건 → 표기 {len(mentions)}건 {by_type}  (dev {sum(m['split'] == 'dev' for m in mentions)} / test {sum(m['split'] == 'test' for m in mentions)})")
     print(f"결측: 고객사 없는 레코드 {sum(not r['client'] for r in records)}, 프로젝트명 없는 레코드 {sum(not r['project'] for r in records)}, 기술 없는 레코드 {sum(not r['skills'] for r in records)}")
-    print(f"정답 있는 표기 {n_gold}/{len(mentions)}" + ("" if n_gold == len(mentions) else "  ← 정답이 빈 표기는 정확도 계산에서 오답으로 잡힌다. 비용·시간만 볼 것"))
+    print(f"정답 있는 표기 {n_gold}/{len(mentions)}" + ("" if n_gold == len(mentions) else "  ← 정답이 빈 표기가 있다. check_data.py 가 오류로 잡으니 정답 칸을 채울 것(목록에 없으면 NONE)"))
     print(f"k=all 선택지 수(NONE 포함): {n_choices}" + ("  ← 20 초과: LLM 은 --over20 logit_bias 필요" if max(n_choices.values()) > 20 else ""))
     for x in warn[:10]:
         print(" 경고:", x)
